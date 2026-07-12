@@ -1,7 +1,6 @@
 import os
 import json
 import base64
-import tempfile
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI
@@ -24,13 +23,12 @@ EMPTY_RESULT = {
     "allowed_values": {}, "value_range": {}, "correlation": []
 }
 
-SYSTEM_PROMPT = """You are a strict data-extraction engine.
-You will be given a transcript of spoken audio describing a small dataset
-(column names, values, and/or statistics being read aloud).
+SYSTEM_PROMPT = """You will be given spoken audio describing a small dataset
+(column names, values, and/or statistics spoken aloud).
 
-Reconstruct the dataset as best as possible from the transcript, then
+Listen carefully, reconstruct the dataset as best as possible, then
 compute and return ONLY a single JSON object with EXACTLY these keys,
-no extra keys, no markdown, no explanation:
+no extra keys, no markdown, no explanation, no code fences:
 
 {
   "rows": <integer, number of data rows>,
@@ -45,35 +43,36 @@ no extra keys, no markdown, no explanation:
   "range": {<column: number>, ...},
   "allowed_values": {<column: [list of allowed/unique values]>, ...},
   "value_range": {<column: [min, max]>, ...},
-  "correlation": [[<numbers>], [<numbers>], ...]  (matrix, numeric columns only, or [] if not applicable)
+  "correlation": [[<numbers>], [<numbers>], ...]
 }
 
 Only include a stat for a column if it is numeric and applicable.
-If the transcript does not give enough info for a field, use an empty
+If the audio does not give enough info for a field, use an empty
 object {} or empty list [] for that field, but ALWAYS include ALL keys.
-Return raw JSON only — no ```json fences, no commentary.
+Return raw JSON only.
 """
 
-def transcribe_audio(audio_bytes: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-    try:
-        with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f
-            )
-        return result.text
-    finally:
-        os.remove(tmp_path)
+def detect_audio_format(audio_bytes: bytes) -> str:
+    if audio_bytes[:4] == b"RIFF":
+        return "wav"
+    if audio_bytes[:3] == b"ID3" or audio_bytes[:2] == b"\xff\xfb":
+        return "mp3"
+    return "wav"
 
-def extract_stats(transcript: str) -> dict:
+def analyze_audio(audio_b64: str, audio_bytes: bytes) -> dict:
+    fmt = detect_audio_format(audio_bytes)
     completion = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-audio-mini",
+        modalities=["text"],
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcript:\n{transcript}"}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Analyze this audio and return the JSON."},
+                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": fmt}}
+                ]
+            }
         ],
         temperature=0
     )
@@ -99,8 +98,7 @@ async def analyze(request: Request):
         body = await request.json()
         audio_b64 = body.get("audio_base64", "")
         audio_bytes = base64.b64decode(audio_b64)
-        transcript = transcribe_audio(audio_bytes)
-        result = extract_stats(transcript)
+        result = analyze_audio(audio_b64, audio_bytes)
         return JSONResponse(content=result)
     except Exception as e:
         fallback = dict(EMPTY_RESULT)
